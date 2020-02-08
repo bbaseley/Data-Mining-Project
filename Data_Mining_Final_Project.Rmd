@@ -1,0 +1,473 @@
+---
+title: "Data Mining Final Project"
+author: "Braden Baseley"
+output: pdf_document
+---
+
+# Overview: Predicting State-Level Homeless Populations
+According to the most recent data from the United States Department of Housing and Urban Development's (HUD) *Annual Homeless Assessment Report to Congress*, more than half a million Americans experienced homelessness on a given night in 2018. In order to count the homeless population, HUD conducts a point-in-time estimate in nearly 3,000 cities and counties in the United States. The point-in-time data collection process occurs every year on a single night in January, wherein state and local planning agencies (known as "Continuums of Care") work alongside volunteers to identify the number of homeless people.
+
+My motivation for this project is to see if there's a model that can be trained to estimate the homeless population using existing state-level economic and demographic indicators. In particular, I want to train a predictive model using HUD data alongside a number of other variables pulled from the U.S. Census Bureau's American Community Survey 5-Year Estimates. Additionally, I will add a categorical variable, $region$, in order to control for variation in homelessness across different parts of the country. Before I can build some models, I have to collect all of the data myself, which I outline in the steps below.
+
+## Grab and Clean Homeless Data from HUD
+HUD data can be found [here](https://www.hudexchange.info/resource/5783/2018-ahar-part-1-pit-estimates-of-homelessness-in-the-us/). The first step is to collect data on the number of homeless people in each state, which is given as an XLSX file (2007 - 2018 Point-in-Time Estimates by State). The XLSX file has multiple tabs for each year, so I will use the `readxl` package to read in all of the sheets at once. The most recent year for most of my covariates is 2017, so I will only be pulling data from 2010 to 2017 in order to build the predictive model. I'll also use the `purrr` package in the `tidyverse` to automate repetitive tasks.
+
+```{r message=FALSE, warning=FALSE}
+library(readxl)
+library(tidyverse)
+
+states_list <- data.frame(state.abb, state.name, state.region) 
+file <- "homeless.xlsx" # HUD data file name
+sheets <- excel_sheets(file)[3:10] # Grab 2017-2010 sheets only
+
+homeless_raw <- sheets %>% 
+  map(~ read_excel(file, sheet = .))
+
+homeless_df <- homeless_raw %>% 
+  map_dfc(rbind)
+```
+
+Currently, all of the data is pieced together column-wise. I will now use `dplyr` and `tidyr` functions to make the data frame more tidy.
+```{r warning=FALSE}
+homeless_clean <- homeless_df %>%
+  select(State, contains("Overall")) %>% # Only select the overall number of homeless
+  gather(key, value, -State) %>% 
+  separate(key, into = c("overall", "year"), sep = ",") %>%
+  transmute(state.abb = State, year = year, homeless = value) %>%
+  inner_join(states_list, by = "state.abb") %>% 
+  select(state = state.name, year, homeless, region = state.region)
+
+homeless_clean$year <- as.integer(str_remove(homeless_clean$year, " "))
+homeless_clean$homeless <- as.numeric(homeless_clean$homeless)
+```
+
+## Grab and Clean Data from Census
+Next, I will grab economic and social characteristics from the U.S. Census Bureau's American Community Survey (ACS). I will make use of the `tidycensus` package (an API client) to quickly grab the data because it is by far the easiest way to get the data into a data frame. I will be collecting 4 separate variables from the ACS: proportion of veterans, median gross rent as a share of household income (measure of housing affordability), Gini indexes (measure of income inequality) and population statistics for each state. I selected these variables based upon a quick review of academic research on homelessness.
+
+To pull all of the years at once, I will again make use of the `purrr` package to quickly iterate these processes. The data is relatively clean, although I have to recode the name of the years so that I can join this data frame with the HUD data frame. **Note: Because the API requires a key, the code will not run on another machine. I included an RDS file of the final data set with my submission if you want to run it in the third chunk below.**
+
+```{r message=FALSE, warning=FALSE}
+library(tidycensus)
+years <- 2010:2017
+
+# Get the proportion of veterans living in each state
+veteran_raw <- years %>% 
+  map_dfr(~ get_acs(geography = "state",
+                    year = .,
+                    variables = "S0102_C01_042",
+                    key = Sys.getenv("CENSUS_TOKEN")),
+          .id = "years")
+
+veteran_clean <- veteran_raw %>% mutate(year = 
+                                          case_when(
+                                            years == 1 ~ '2010',
+                                            years == 2 ~ '2011',
+                                            years == 3 ~ '2012',
+                                            years == 4 ~ '2013',
+                                            years == 5 ~ '2014',
+                                            years == 6 ~ '2015',
+                                            years == 7 ~ '2016',
+                                            years == 8 ~ '2017')) %>%
+  select(year, state = NAME, perc_veteran = estimate)
+
+
+# Get the Gini index for each state
+gini_raw <- years %>% 
+  map_dfr(~ get_acs(geography = "state",
+                    year = .,
+                    variables = "B19083_001E",
+                    key = Sys.getenv("CENSUS_TOKEN")),
+          .id = "years")
+
+gini_clean <- gini_raw %>% mutate(year = 
+                                    case_when(
+                                      years == 1 ~ '2010',
+                                      years == 2 ~ '2011',
+                                      years == 3 ~ '2012',
+                                      years == 4 ~ '2013',
+                                      years == 5 ~ '2014',
+                                      years == 6 ~ '2015',
+                                      years == 7 ~ '2016',
+                                      years == 8 ~ '2017')) %>%
+  select(year, state = NAME, gini = estimate)
+
+
+# Get median gross rent as a share of household income for each state
+affordability_raw <- years %>% 
+  map_dfr(~ get_acs(geography = "state",
+                    year = .,
+                    variables = "B25071_001E",
+                    key = Sys.getenv("CENSUS_TOKEN")),
+          .id = "years")
+
+affordability_clean <- affordability_raw %>% mutate(year = 
+                                                      case_when(
+                                                        years == 1 ~ '2010',
+                                                        years == 2 ~ '2011',
+                                                        years == 3 ~ '2012',
+                                                        years == 4 ~ '2013',
+                                                        years == 5 ~ '2014',
+                                                        years == 6 ~ '2015',
+                                                        years == 7 ~ '2016',
+                                                        years == 8 ~ '2017')) %>%
+  select(year, state = NAME, affordability = estimate)
+
+
+# Get population estimate for each state
+population_raw <- years %>% 
+  map_dfr(~ get_acs(geography = "state",
+                    year = .,
+                    variables = "B01003_001E",
+                    key = Sys.getenv("CENSUS_TOKEN")),
+          .id = "years")
+
+population_clean <- population_raw %>% mutate(year = 
+                                                case_when(
+                                                  years == 1 ~ '2010',
+                                                  years == 2 ~ '2011',
+                                                  years == 3 ~ '2012',
+                                                  years == 4 ~ '2013',
+                                                  years == 5 ~ '2014',
+                                                  years == 6 ~ '2015',
+                                                  years == 7 ~ '2016',
+                                                  years == 8 ~ '2017')) %>%
+  select(year, state = NAME, population = estimate)
+```
+
+Now that I have collected all of the data, I need to join all of the data frames together to create one clean data set.
+
+```{r message=FALSE}
+library(dplyr)
+
+homeless_clean$state <- as.character(homeless_clean$state) 
+homeless_clean$year <- as.character(homeless_clean$year)
+
+final_data <- homeless_clean %>%
+  left_join(affordability_clean, by = c("state", "year")) %>%
+  left_join(gini_clean, by = c("state", "year")) %>%
+  left_join(population_clean, by = c("state", "year")) %>%
+  left_join(veteran_clean, by = c("state", "year")) %>%
+  select(-state, -year)
+
+saveRDS(final_data, "final_data.RDS")
+```
+
+# Building the Models
+Now that I have gathered and cleaned my data, I will split the overall dataset into training and testing sets.
+```{r message=FALSE}
+library(caret)
+set.seed(12345)
+final_data <- readRDS("final_data.RDS")
+in_train <- createDataPartition(y = final_data$homeless, p = 0.8, list = FALSE)
+training <- final_data[in_train, ]
+testing <- final_data[-in_train, ]
+```
+
+## Linear Models
+I will begin by running a few linear models. In particular, `lm1` regresses the homeless population against all of the variables, `lm2` includes all of the main effects and pairwise interactions, and `lm3` includes all of the main effects/interactions as well as squared terms for all of the continuous variables. I presume some of these models will overfit the training data, so I will also pass each of them through the `step` function, which finds the lowest AIC, to see if I can get better results.
+```{r}
+lm1 <- lm(homeless ~ ., data = training)
+lm2 <- lm(homeless ~ (.)^2, data = training)
+lm3 <- lm(homeless ~ (.)^2 + I(affordability^2) + I(gini^2) + 
+            I(population^2) + I(perc_veteran^2), data = training)
+lm4 <- step(lm1, trace = FALSE)
+lm5 <- step(lm2, trace = FALSE)
+lm6 <- step(lm3, trace = FALSE)
+
+(summary_lm1 <- defaultSummary(data.frame(obs = testing$homeless, 
+                                          pred = predict(lm1, newdata = testing))))
+(summary_lm2 <- defaultSummary(data.frame(obs = testing$homeless, 
+                                          pred = predict(lm2, newdata = testing))))
+(summary_lm3 <- defaultSummary(data.frame(obs = testing$homeless, 
+                                          pred = predict(lm3, newdata = testing))))
+(summary_lm4 <- defaultSummary(data.frame(obs = testing$homeless, 
+                                          pred = predict(lm4, newdata = testing))))
+(summary_lm5 <- defaultSummary(data.frame(obs = testing$homeless, 
+                                          pred = predict(lm5, newdata = testing))))
+(summary_lm6 <- defaultSummary(data.frame(obs = testing$homeless, 
+                                          pred = predict(lm6, newdata = testing))))
+```
+
+Looking at the results of these models, `lm5` has the lowest root mean squared error (RMSE) in the testing data. However, it should be noted that `lm5` performs  better than `lm2` by a very small margin. There is little difference in the models practically, but from a data mining approach, I would still choose `lm5` because it predicts best in the testing data. 
+
+The only difference between `lm5` and `lm2` is that `lm5` does not include the interaction between $region$ and $perc\_veteran$, which was removed by the `step` function (see below). Generally speaking, the more 'complex' models that include interactions and other transformations perform better in the testing data compared to the simplest model `lm1`, which only includes the main effects. Moving forward, I will use the formulas from `lm2` and `lm5` when running different algorithms.
+
+```{r}
+setdiff(names(coef(lm2)), names(coef(lm5)))
+```
+
+## Elastic Net
+Next, I will try two elastic net models using the formulas from `lm2` and `lm5`. This model entails the use of several tuning parameters in order to shrink the coefficients to zero, which I will optimize through cross validation.
+```{r}
+ctrl <- trainControl(method = "cv", number = 10)
+elastic_grid <- expand.grid(.lambda = seq(.05, 1, length = 10), 
+                            .alpha = seq(.05, 1, length = 10))
+
+elastic1 <- train(formula(lm2), data = training, method = "glmnet", 
+                  trControl = ctrl, tuneGrid = elastic_grid)
+elastic2 <- train(formula(lm5), data = training, method = "glmnet", 
+                  trControl = ctrl, tuneGrid = elastic_grid)
+
+(summary_elastic1 <- defaultSummary(data.frame(obs = testing$homeless, 
+                                               pred = predict(elastic1, newdata = testing))))
+(summary_elastic2 <- defaultSummary(data.frame(obs = testing$homeless, 
+                                               pred = predict(elastic2, newdata = testing))))
+```
+
+The elastic net models perform worse in the testing data (in terms of RMSE) compared to `lm5` from earlier. The first elastic net model, which includes all of the main effects and interactions, performs a little better in the testing data compared to the second elastic net model (which removed the interaction between $region$ and $perc\_veteran$). Looking at the best tune for each of the models, the alpha is equal to 1 for both model, implying a lasso regression was the best tune for each model.
+
+```{r}
+elastic1$bestTune
+elastic2$bestTune
+```
+
+## Least Angle Regression
+Next, I will run a couple least angle regression models, which build off of elastic net. Again, I must specify various values for the tuning parameters, which will be optimized using cross validation.
+```{r}
+lar_grid <- expand.grid(.fraction = seq(.05, 1, length = 10))
+lar1 <- train(homeless ~ (.)^2, data = training, method = "lars", 
+              trControl = ctrl, tuneGrid = lar_grid)
+lar2 <- train(homeless ~ (.)^2 -region:perc_veteran, data = training, 
+              method = "lars", trControl = ctrl, tuneGrid = lar_grid)
+
+(summary_lar1 <- defaultSummary(data.frame(obs = testing$homeless, 
+                                           pred = predict(lar1, newdata = testing))))
+(summary_lar2 <- defaultSummary(data.frame(obs = testing$homeless, 
+                                           pred = predict(lar2, newdata = testing))))
+```
+Interestingly, the RMSE for `lar2` is the same as the RMSE  for `lm5`, so these are the best performing models thus far. The best tune for `lar1` and `lar2` occurs when fraction = 0.7888889 and fraction = 1, respectively.
+
+```{r}
+lar1$bestTune
+lar2$bestTune
+```
+
+## Partial Least Squares
+I will not try partial least squares. This method involves reducing the dimensionality of the data set by finding linear combinations of the predictor variables. I am not sure how effective this method will be given that my data set does not have that many predictors, but I will nevertheless try it out. The main tuning parameter is the number of components, which I shall optimize using cross validation.
+```{r}
+pls1 <- train(homeless ~ (.)^2, data = training, method = "pls", 
+              tuneLength = 20, trControl = ctrl)
+pls2 <- train(homeless ~ (.)^2 -region:perc_veteran, data = training, method = "pls", 
+              tuneLength = 20, trControl = ctrl)
+
+(summary_pls1 <- defaultSummary(data.frame(obs = testing$homeless, 
+                                           pred = predict(pls1, newdata = testing))))
+(summary_pls2 <- defaultSummary(data.frame(obs = testing$homeless, 
+                                           pred = predict(pls2, newdata = testing))))
+```
+
+As expected, the two partial least squares models fail to perform better in the testing data compared to `lm5`/`lar2` from earlier. In this case, the first partial least squares model performs slightly better in the testing data than the second partial least squares model. The best tune occurs when the number of components is equal to 10 and 11 for `pls1` and `pls2`, respectively.
+
+```{r}
+pls1$bestTune
+pls2$bestTune
+```
+
+## Robust Method
+Because I do not fully understand the data generation process, I am also running a robust model for good measure. Looking at the boxplots for my variables, it appears that all of them (except for $gini$) have outliers.
+```{r message=FALSE, warning=FALSE}
+library(robustbase)
+robust1 <- lmrob(homeless ~ (.)^2, data = training)
+robust2 <- lmrob(homeless ~ (.)^2 - region:perc_veteran, data = training)
+
+(summary_robust1 <- defaultSummary(data.frame(obs = testing$homeless, 
+                                              pred = predict(robust1, data = testing))))
+(summary_robust2 <- defaultSummary(data.frame(obs = testing$homeless, 
+                                              pred = predict(robust2, data = testing))))
+```
+
+The RMSEs for both of the robust models are significantly higher compared to the RMSEs for all of the models I have run thus far. The second model performs slightly better in the testing data than the first model, albeit by a very small amount.
+
+## MARS
+Next up, I will try Multivariate Adaptive Regression Splines (MARS) models. MARS also requires several tuning parameters to be optimized using cross validation. Because MARS conducts feature selection, I will just run a single model with all of the main effects and pairwise interactions.
+```{r message=FALSE}
+MARS <- train(homeless ~ (.)^2, data = training, method = "earth", 
+              trControl = ctrl, tuneGrid = expand.grid(.degree = 1:3, .nprune = 1:10))
+
+(summary_MARS <- defaultSummary(data.frame(obs = testing$homeless, 
+                                            pred = predict(MARS, newdata = testing)[ , 1])))
+```
+
+The MARS model performs better in the testing data compared to `lm5`/`lar2` from earlier, which heretofore had been the best performing models. The best tune occurs when nprune = 9 and degree = 1.
+
+```{r}
+MARS$bestTune
+```
+
+## GAM
+I will now run a generalized additive model (GAM). This method allows for non-linear functions of each of the variables while maintaining additivity. I will try two models: Model 1 will have degrees of freedom set to 3 for all variables, whereas Model 2 will have degrees of freedom set to 4 for all variables.
+```{r message=FALSE, warning=FALSE}
+library(gam)
+gam1 <- gam(homeless ~ s(affordability, df = 3) + s(gini, df = 3) + 
+              s(population, df = 3) + s(perc_veteran, df = 3) + region, data = training)
+gam2 <- gam(homeless ~ s(affordability, df = 4) + s(gini, df = 4) + 
+              s(population, df = 4) + s(perc_veteran, df = 4) + region, data = training)
+
+(summary_gam1 <- defaultSummary(data.frame(obs = testing$homeless, 
+                                           pred = predict(gam1, newdata = testing))))
+(summary_gam2 <- defaultSummary(data.frame(obs = testing$homeless, 
+                                           pred = predict(gam2, newdata = testing))))
+```
+
+The GAM models both have higher RMSEs compared to the MARS model, meaning that they perform relatively worse in the testing data. The second model, which has a slightly higher value for the degrees of freedom, performs better than `gam1` with respect to the RMSE.
+
+## Single Tree
+I will now try a few different tree methods, beginning with a single tree. I do not have to create interaction terms because the model estimates nonlinear effects by splitting on a sequence of variables. The main tuning parameter is cp, which is optimized using cross validation.
+```{r message=FALSE, warning=FALSE}
+tree1 <- train(homeless ~ ., data = training, method = "rpart", tuneLength = 10, trControl = ctrl)
+
+(summary_tree1 <- defaultSummary(data.frame(obs = testing$homeless, 
+                                            pred = predict(tree1, newdata = testing))))
+```
+
+The RMSE for the single tree is higher than the MARS model, meaning that it predicts relatively worse in the testing data. The best tune occurs when cp = 0.0006, meaning that there is a very low degree of penalization. 
+
+```{r}
+tree1$bestTune
+```
+
+## Bagging
+The initial tree model suffers from high variance, so I will use the bagging method (which reduces variance by averaging) to see if I can build a better model.
+```{r}
+library(doMC)
+bag <- train(homeless ~ ., data = training, method = "treebag")
+
+(summary_bag <- defaultSummary(data.frame(obs = testing$homeless, 
+                                          pred = predict(bag, newdata = testing))))
+```
+
+The bagging method does better compared to the single tree, although it still under performs compared to the MARS model from earlier.
+
+## Random Forest
+Next, I will try a random forest model. This method builds off of bagging by making a small tweak that decorrelates the trees. The tuning parameter mtry will be optimized using cross validation.
+```{r}
+rf <- train(homeless ~ ., data = training, method = "rf", trControl = ctrl, 
+         tuneGrid = data.frame(.mtry = 2:(ncol(training) - 1L)), 
+         ntrees = 1000, importance = TRUE)
+
+(summary_rf <- defaultSummary(data.frame(obs = testing$homeless, 
+                                         pred = predict(rf, newdata = testing))))
+```
+
+The random forest model now has the lowest RMSE among all of the models I have tried, so it predicts best in the testing data. The optimal tune occurs when mtry = 5.
+
+```{r}
+rf$bestTune
+```
+
+## Boosting
+I will now try a boosting model, which is considered a "slow learning" method. Like many models before it, the boosting model requires several tuning parameters to be optimized using cross validation.
+```{r message=FALSE, warning=FALSE}
+boost <- train(homeless ~ ., data = training, method = "gbm",
+      trControl = ctrl, 
+      tuneGrid = expand.grid(.interaction.depth = seq(1, 7, by = 2),
+                             .n.trees = seq(100, 1000, by = 50),
+                             .shrinkage = c(0.01, 0.1),
+                             .n.minobsinnode = 1:10), 
+      train.fraction = 0.9, verbose = FALSE)
+
+(summary_boost <- defaultSummary(data.frame(obs = testing$homeless, 
+                                            pred = predict(boost, newdata = testing))))
+```
+
+The boosting model now has the lowest RMSE among all of the models, besting the random forest by a decent amount. The final values used for the model can be found below.
+
+```{r}
+boost$bestTune
+```
+
+## Neural Network
+Moving away from tree-based models, I will now try a neural network model. This model builds surrogate predictors (using linear combinations of predictors) to use in a non-linear model. The tuning parameters, decay and size, will be optimized using cross validation.
+```{r}
+nn <- train(homeless ~ ., data = training, method = "nnet",
+      trControl = ctrl, tuneGrid = expand.grid(.decay = c(0, 0.01, .1),
+                                               .size = c(1:10)),
+      preProcess = c("center", "scale"), trace = FALSE)
+
+(summary_nn <- defaultSummary(data.frame(obs = testing$homeless, 
+                                         pred = predict(nn, newdata = testing))))
+```
+
+The RMSE for the neural networks is quite large compared to the boosting model. The final values used for the model were size = 1 and decay = 0.01.
+
+```{r}
+nn$bestTune
+```
+
+## K Nearest Neighbors
+The K Nearest Neighbors method requires tuning the value of k, which can be achieved using cross validation.
+```{r}
+knn <- train(homeless ~ ., data = training, method = "knn",
+      trControl = ctrl, tuneGrid = data.frame(.k = 1:20))
+
+(summary_knn <- defaultSummary(data.frame(obs = testing$homeless, 
+                                          pred = predict(knn, newdata = testing))))
+```
+The K Nearest Neighbors model predicts decently well. Nevertheless, it has a higher RMSE in the testing data compared to the boosting model, so it predicts relatively worse in the testing data. The final value used for the model was k = 6.
+
+```{r}
+knn$bestTune
+```
+
+## Bayesian Additive Regression Trees
+Lastly, I will run a Bayesian additive regression tree. First, I must find the best values for the tuning parameters via cross validation.
+```{r message=FALSE, results = "hide"}
+library(dbarts)
+n.trees_seq <- seq(from = 50, to = 100, by = 10)
+power_seq <- seq(from = 1, to = 3, by = .4)
+base_seq <- seq(from = .Machine$double.eps, 
+                to = 1 - .Machine$double.eps, by = .2)
+bayes <- xbart(homeless ~ ., data = training, 
+             drop = FALSE, verbose = TRUE, n.reps = 10,
+             n.threads = parallel::detectCores(),
+             n.trees = n.trees_seq, power = power_seq, base = base_seq)
+```
+
+```{r}
+(best <- as.data.frame(which(bayes == min(bayes), arr.ind = TRUE)))
+```
+
+Now, I will re-run the model with the optimal parameters from above.
+
+```{r include=FALSE}
+bayes2 <- bart2(homeless ~ ., data = training, test = testing, 
+             n.trees = n.trees_seq[best$n.trees],
+             base = base_seq[best$base], 
+             power = power_seq[best$power])
+```
+
+```{r}
+(summary_bayes <- defaultSummary(data.frame(obs = testing$homeless,
+                          pred = apply(bayes2$yhat.test, 3, FUN = mean))))
+```
+The RMSE for the Bayesian model is low but not quite as low as the boosting method.
+
+# Summary
+In summary, across all of the models that I ran, the boosting model had the lowest RMSE in the testing data. Because this method performed the best in the testing data, I would use this model over the others in order to forecast state-level homeless populations. However, a drawback of using this model is that it is not easy to interpret, so it does not offer much detail as to how/why these variables contribute to homelessness, which would normally be of interest to social scientists or policymakers. Therefore, this model is only useful insofar as making predictions and not much else.
+
+```{r}
+summary <- data.frame(model = c("lm1", "lm2", "lm3", "lm4", "lm5", "lm6", "elastic1", "elastic2", "lar1", "lar2",
+                                "pls1", "pls2", "robust1", "robust2", "MARS", "gam1", "gam2", "tree1",
+                                "bag", "rf", "boost", "nn", "knn", "bayes"),
+                      rmse = c(summary_lm1[1], summary_lm2[1], summary_lm3[1], 
+                               summary_lm4[1], summary_lm5[1], summary_lm6[1],
+                               summary_elastic1[1], summary_elastic2[1], 
+                               summary_lar1[1], summary_lar2[1], 
+                               summary_pls1[1], summary_pls1[1],
+                               summary_robust1[1], summary_robust2[1], 
+                               summary_MARS[1],
+                               summary_gam1[1], summary_gam2[1],
+                               summary_tree1[1], summary_bag[1],
+                               summary_rf[1], summary_boost[1],
+                               summary_nn[1], summary_knn[1], summary_bayes[1]))
+
+summary
+```
+
+```{r}
+library(ggplot2)
+library(dplyr)
+summary %>% mutate(model = reorder(model, -rmse)) %>% ggplot(aes(x = model, y = rmse)) + 
+  geom_col() + coord_flip()
+```
+
